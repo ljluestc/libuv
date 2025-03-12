@@ -993,11 +993,29 @@ static int uv__spawn_and_init_child(
 }
 #endif /* ISN'T TARGET_OS_TV || TARGET_OS_WATCH */
 
-int uv_spawn(uv_loop_t* loop,
-             uv_process_t* process,
-             const uv_process_options_t* options) {
+
+static void uv__process_child_init(const uv_process_options_t* options,
+                                   int stdio_count,
+                                   int (*pipes)[2],
+                                   int error_fd) {
+  int i;
+  for (i = 0; i < stdio_count; i++) {
+    if (options->stdio[i].flags & UV_CREATE_PIPE) {
+      dup2(pipes[i][0], i);
+      close(pipes[i][0]);
+      close(pipes[i][1]);
+    }
+  }
+  if (options->file) {
+    execvp(options->file, options->args);
+    write(error_fd, &errno, sizeof(errno));
+  }
+  _exit(127);
+}
+
+int uv_spawn(uv_loop_t* loop, uv_process_t* process, const uv_process_options_t* options) {
 #if defined(__APPLE__) && (TARGET_OS_TV || TARGET_OS_WATCH)
-  /* fork is marked __WATCHOS_PROHIBITED __TVOS_PROHIBITED. */
+  /* fork is prohibited on tvOS/watchOS */
   return UV_ENOSYS;
 #else
   int pipes_storage[8][2];
@@ -1005,8 +1023,12 @@ int uv_spawn(uv_loop_t* loop,
   int stdio_count;
   pid_t pid;
   int err;
-  int exec_errorno;
   int i;
+
+  /* Validate options */
+  if (options->file == NULL || options->args == NULL) {
+    return UV_EINVAL;
+  }
 
   if (options->cpumask != NULL) {
 #if defined(__linux__) || defined(__FreeBSD__)
@@ -1017,6 +1039,78 @@ int uv_spawn(uv_loop_t* loop,
     return UV_ENOTSUP;
 #endif
   }
+
+  /* Initialize process handle */
+  uv__handle_init(loop, (uv_handle_t*)process, UV_PROCESS);
+  process->exit_cb = options->exit_cb;
+  process->pid = 0;
+
+  /* Set up stdio pipes */
+  stdio_count = options->stdio_count > 8 ? 8 : options->stdio_count;
+  pipes = pipes_storage;
+
+  for (i = 0; i < stdio_count; i++) {
+    if (pipe(pipes[i]) != 0) {
+      err = UV__ERR(errno);
+      while (i--) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+      }
+      return err;
+    }
+  }
+
+  /* Call pre-spawn hook in parent */
+  if (options->pre_spawn_cb) {
+    options->pre_spawn_cb(process, options->user_data);
+  }
+
+  pid = fork();
+  if (pid < 0) {
+    err = UV__ERR(errno);
+    for (i = 0; i < stdio_count; i++) {
+      close(pipes[i][0]);
+      close(pipes[i][1]);
+    }
+    return err;
+  }
+
+  if (pid == 0) {
+    /* Child process */
+    if (options->post_spawn_cb) {
+      options->post_spawn_cb(process, options->user_data);  /* POSIX-safe calls only */
+    }
+    uv__process_child_init(options, stdio_count, pipes, pipes[0][1]);
+    _exit(127);  /* Should not reach here */
+  }
+
+  /* Parent process */
+  process->pid = pid;
+  uv__handle_start(process);
+
+  /* Close child ends of pipes */
+  for (i = 0; i < stdio_count; i++) {
+    close(pipes[i][1]);
+    if (options->stdio[i].flags & UV_CREATE_PIPE) {
+      uv_pipe_t* pipe = uv__malloc(sizeof(uv_pipe_t));
+      if (pipe == NULL) {
+        uv_process_kill(process, SIGTERM);
+        return UV_ENOMEM;
+      }
+      uv_pipe_init(loop, pipe, 0);
+      uv__stream_open((uv_stream_t*)pipe, pipes[i][0], UV_WRITABLE);
+      process->stdio[i].data.stream = (uv_stream_t*)pipe;
+    }
+  }
+
+  /* Call post-spawn hook in parent */
+  if (options->post_spawn_cb) {
+    options->post_spawn_cb(process, options->user_data);
+  }
+
+  return 0;
+#endif
+}
 
   assert(options->file != NULL);
   assert(!(options->flags & ~(UV_PROCESS_DETACHED |
