@@ -4869,6 +4869,29 @@ TEST_IMPL(fs_stat_batch_multiple) {
   return 0;
 }
 
+TEST_IMPL(fs_open_extra_flags) {
+  uv_fs_t req;
+  int r;
+  r = uv_fs_open(uv_default_loop(), &req, "test.txt", O_CREAT | O_WRONLY, 0644, UV_FS_O_EXCL, NULL);
+  ASSERT(r >= 0);
+  uv_fs_req_cleanup(&req);
+  r = uv_fs_unlink(uv_default_loop(), &req, "test.txt", NULL);
+  ASSERT(r == 0);
+  uv_fs_req_cleanup(&req);
+
+  return 0;
+}
+
+TEST_IMPL(fs_stat_flags) {
+  uv_fs_t req;
+  int r;
+
+  r = uv_fs_stat(uv_default_loop(), &req, "test.txt", UV_FS_STATX, NULL);
+  ASSERT(r == UV_ENOENT);  /* Assuming test.txt doesn’t exist yet */
+  uv_fs_req_cleanup(&req);
+
+  return 0;
+}
 
 #ifdef _WIN32
 TEST_IMPL(fs_wtf) {

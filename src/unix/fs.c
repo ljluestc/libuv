@@ -1984,15 +1984,31 @@ int uv_fs_mkdtemp(uv_loop_t* loop,
 }
 
 
-int uv_fs_mkstemp(uv_loop_t* loop,
-                  uv_fs_t* req,
-                  const char* tpl,
-                  uv_fs_cb cb) {
+int uv_fs_mkstemp(uv_loop_t* loop, uv_fs_t* req, const char* tpl, uv_fs_cb cb) {
   INIT(MKSTEMP);
   req->path = uv__strdup(tpl);
-  if (req->path == NULL)
+  if (req->path == NULL) {
+    req->result = UV_ENOMEM;
     return UV_ENOMEM;
-  POST;
+  }
+  
+  if (cb) {
+    uv__work_submit(loop, &req->work_req, UV__WORK_FS, uv__fs_work, uv__fs_done);
+    return 0;
+  } else {
+    char result_path[PATH_MAX];
+    req->result = uv__fs_mkstemp(tpl, result_path);
+    if (req->result >= 0) {
+      req->file = req->result; /* Store the file descriptor */
+      req->result = 0; /* Success */
+      req->new_path = uv__strdup(result_path); /* Store the generated path */
+      if (req->new_path == NULL) {
+        close(req->file);
+        req->result = UV_ENOMEM;
+      }
+    }
+    return req->result;
+  }
 }
 
 
@@ -2004,11 +2020,15 @@ int uv_fs_open(uv_loop_t* loop,
                uv_fs_cb cb) {
   INIT(OPEN);
   PATH;
+  int open_flags = flags;
+  if (extra_flags & UV_FS_O_EXCL) open_flags |= O_EXCL;
+  if (extra_flags & UV_FS_O_DIRECT) open_flags |= O_DIRECT;
   req->flags = flags;
   req->mode = mode;
   if (cb != NULL)
-    if (uv__iou_fs_open(loop, req))
+    if (uv__iou_fs_open(loop, req)) {
       return 0;
+    }
   POST;
 }
 
@@ -2049,14 +2069,14 @@ post:
 }
 
 
-int uv_fs_scandir(uv_loop_t* loop,
-                  uv_fs_t* req,
-                  const char* path,
-                  int flags,
-                  uv_fs_cb cb) {
+int uv_fs_scandir(uv_loop_t* loop, uv_fs_t* req, const char* path,
+                  int flags, unsigned int extra_flags, uv_fs_cb cb) {
   INIT(SCANDIR);
   PATH;
   req->flags = flags;
+  if (extra_flags & UV_FS_SCANDIR_RECURSIVE) {
+    req->extra_flags = extra_flags;
+  }
   POST;
 }
 
@@ -2066,9 +2086,11 @@ int uv_fs_opendir(uv_loop_t* loop,
                   uv_fs_cb cb) {
   INIT(OPENDIR);
   PATH;
+  if (flags & UV_FS_DIR_ASYNC) {
+    req->flags = flags;
+  }
   POST;
 }
-
 int uv_fs_readdir(uv_loop_t* loop,
                   uv_fs_t* req,
                   uv_dir_t* dir,
@@ -2155,12 +2177,13 @@ int uv_fs_sendfile(uv_loop_t* loop,
 int uv_fs_stat(uv_loop_t* loop, uv_fs_t* req, const char* path, uv_fs_cb cb) {
   INIT(STAT);
   PATH;
-  if (cb != NULL)
-    if (uv__iou_fs_statx(loop, req, /* is_fstat */ 0, /* is_lstat */ 0))
-      return 0;
-  POST;
+  req->result = (flags & UV_FS_STATX) ? statx(AT_FDCWD, path, 0, 0, &req->statbuf) : stat(path, &req->statbuf);
+  if (req->result < 0) {
+    req->result = uv_translate_sys_error(errno);
+    uv__req_unregister(loop, req);
+  }
+  return req->result;
 }
-
 
 int uv_fs_symlink(uv_loop_t* loop,
                   uv_fs_t* req,
